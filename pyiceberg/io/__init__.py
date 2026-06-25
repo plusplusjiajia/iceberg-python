@@ -27,8 +27,11 @@ from __future__ import annotations
 
 import importlib
 import logging
+import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from io import SEEK_SET
 from types import TracebackType
 from typing import (
@@ -251,13 +254,80 @@ class OutputFile(ABC):
         """
 
 
+class VendedCredentialsProvider:
+    """Holds vended storage credentials and proactively re-fetches them before they expire.
+
+    Mirrors Iceberg Java's vended-credential refresh: when the current credentials are
+    within ``REFRESH_BUFFER_MS`` of expiry, :meth:`credentials` invokes the ``refresh``
+    callable to obtain a fresh set. A monotonically increasing :attr:`generation` lets a
+    FileIO detect when it must rebuild any cached filesystem client.
+
+    ``refresh`` returns ``(properties, expires_at_ms)``; ``expires_at_ms`` may be ``None``
+    (no known expiry → never refreshes).
+    """
+
+    REFRESH_BUFFER_MS = 5 * 60 * 1000  # refresh when <= 5 minutes from expiry, like Java
+
+    def __init__(
+        self,
+        credentials: Properties,
+        expires_at_ms: int | None,
+        refresh: Callable[[], tuple[Properties, int | None]],
+    ) -> None:
+        self._credentials: Properties = dict(credentials)
+        self._expires_at_ms = expires_at_ms
+        self._refresh = refresh
+        self.generation = 0
+        self._lock = threading.Lock()
+
+    def _needs_refresh(self) -> bool:
+        if self._expires_at_ms is None:
+            return False
+        return time.time() * 1000 >= self._expires_at_ms - self.REFRESH_BUFFER_MS
+
+    def _is_expired(self) -> bool:
+        return self._expires_at_ms is not None and time.time() * 1000 >= self._expires_at_ms
+
+    def credentials(self) -> Properties:
+        """Return the current credentials, transparently refreshing them if near expiry.
+
+        Thread-safe: PyIceberg reads/writes data files from a thread pool, so only one
+        thread refreshes (double-checked under a lock) while the others reuse the result.
+        Within the prefetch window the current credentials are still valid, so a transient
+        refresh failure is swallowed (and retried next call); it is only re-raised once the
+        credentials have actually expired.
+        """
+        if not self._needs_refresh():
+            return self._credentials
+        with self._lock:
+            if not self._needs_refresh():  # another thread may have already refreshed
+                return self._credentials
+            try:
+                new_credentials, new_expires_at_ms = self._refresh()
+            except Exception:
+                if self._is_expired():
+                    raise
+                return self._credentials
+            if new_credentials:
+                self._credentials = dict(new_credentials)
+                self._expires_at_ms = new_expires_at_ms
+                self.generation += 1
+            return self._credentials
+
+
 class FileIO(ABC):
     """A base class for FileIO implementations."""
 
     properties: Properties
+    _credentials_provider: VendedCredentialsProvider | None
 
     def __init__(self, properties: Properties = EMPTY_DICT):
         self.properties = properties
+        self._credentials_provider = None
+
+    def set_credentials_provider(self, provider: VendedCredentialsProvider | None) -> None:
+        """Attach a provider that supplies (and refreshes) vended storage credentials."""
+        self._credentials_provider = provider
 
     @abstractmethod
     def new_input(self, location: str) -> InputFile:

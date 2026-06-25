@@ -34,6 +34,7 @@ import logging
 import operator
 import os
 import re
+import threading
 import uuid
 import warnings
 from abc import ABC, abstractmethod
@@ -380,11 +381,44 @@ class PyArrowFile(InputFile, OutputFile):
         return self
 
 
-class PyArrowFileIO(FileIO):
-    fs_by_scheme: Callable[[str, str | None], FileSystem]
+class _RefreshingFsCache:
+    """Caches FileSystems by ``(scheme, netloc)`` like the original ``lru_cache``, but when the
+    owning FileIO has a :class:`~pyiceberg.io.VendedCredentialsProvider` it refreshes the
+    credentials before serving and rebuilds the cache when they roll over.
 
+    pyarrow's ``S3FileSystem`` takes static credentials at construction, so rebuilding the
+    filesystem is the only way to honor a refreshed (rotated) STS token. ``cache_info`` and
+    ``cache_clear`` are preserved so this stays a drop-in for the previous ``lru_cache``.
+    """
+
+    def __init__(self, file_io: PyArrowFileIO) -> None:
+        self._file_io = file_io
+        self._cache: Callable[[str, str | None], FileSystem] = lru_cache(file_io._initialize_fs)
+        self._generation = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, scheme: str, netloc: str | None = None) -> FileSystem:
+        provider = self._file_io._credentials_provider
+        if provider is not None:
+            fresh = provider.credentials()
+            if provider.generation != self._generation:
+                with self._lock:  # only one thread rebuilds the cache on a credential roll-over
+                    if provider.generation != self._generation:
+                        self._file_io.properties = {**self._file_io.properties, **fresh}
+                        self._cache.cache_clear()
+                        self._generation = provider.generation
+        return self._cache(scheme, netloc)
+
+    def cache_info(self) -> Any:
+        return self._cache.cache_info()
+
+    def cache_clear(self) -> None:
+        self._cache.cache_clear()
+
+
+class PyArrowFileIO(FileIO):
     def __init__(self, properties: Properties = EMPTY_DICT):
-        self.fs_by_scheme: Callable[[str, str | None], FileSystem] = lru_cache(self._initialize_fs)
+        self.fs_by_scheme: _RefreshingFsCache = _RefreshingFsCache(self)
         super().__init__(properties=properties)
 
     @staticmethod
@@ -675,12 +709,14 @@ class PyArrowFileIO(FileIO):
         """Create a dictionary of the PyArrowFileIO fields used when pickling."""
         fileio_copy = copy(self.__dict__)
         fileio_copy["fs_by_scheme"] = None
+        # The credentials provider holds a non-picklable refresh closure (a REST session).
+        fileio_copy["_credentials_provider"] = None
         return fileio_copy
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Deserialize the state into a PyArrowFileIO instance."""
         self.__dict__ = state
-        self.fs_by_scheme = lru_cache(self._initialize_fs)
+        self.fs_by_scheme = _RefreshingFsCache(self)
 
 
 def schema_to_pyarrow(

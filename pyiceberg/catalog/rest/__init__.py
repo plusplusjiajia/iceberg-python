@@ -56,7 +56,15 @@ from pyiceberg.exceptions import (
     TableAlreadyExistsError,
     UnauthorizedError,
 )
-from pyiceberg.io import AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, FileIO, load_file_io
+from pyiceberg.io import (
+    AWS_ACCESS_KEY_ID,
+    AWS_REGION,
+    AWS_SECRET_ACCESS_KEY,
+    AWS_SESSION_TOKEN,
+    FileIO,
+    VendedCredentialsProvider,
+    load_file_io,
+)
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec, assign_fresh_partition_spec_ids
 from pyiceberg.schema import Schema, assign_fresh_schema_ids
 from pyiceberg.table import (
@@ -230,6 +238,10 @@ SIGV4 = "rest.sigv4-enabled"
 SIGV4_REGION = "rest.signing-region"
 SIGV4_SERVICE = "rest.signing-name"
 EMPTY_BODY_SHA256: str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# Vended-credential expiry/refresh keys. Standard (Iceberg REST) first, DLF fallback second.
+S3_SESSION_TOKEN_EXPIRES_AT_MS = "s3.session-token-expires-at-ms"
+OSS_TOKEN_EXPIRATION = "fs.oss.token.expiration"
+REFRESH_CREDENTIALS_ENDPOINT = "client.refresh-credentials-endpoint"
 OAUTH2_SERVER_URI = "oauth2-server-uri"
 SNAPSHOT_LOADING_MODE = "snapshot-loading-mode"
 AUTH = "auth"
@@ -746,7 +758,8 @@ class RestCatalog(Catalog):
                         body_bytes = bytes(request.body)
                     else:
                         raise TypeError(
-                            f"Unsupported request body type for SigV4 signing: {type(request.body).__name__}; expected str or bytes."
+                            f"Unsupported request body type for SigV4 signing: {type(request.body).__name__}; "
+                            "expected str or bytes."
                         )
                     content_sha256_header = base64.b64encode(hashlib.sha256(body_bytes).digest()).decode()
                 else:
@@ -806,19 +819,75 @@ class RestCatalog(Catalog):
 
         return best_match.config if best_match else {}
 
+    @staticmethod
+    def _extract_expires_at_ms(resolved: Properties, storage_credentials: list[StorageCredential]) -> int | None:
+        """Best-effort vended-credential expiry, in epoch milliseconds.
+
+        Prefers the Iceberg-standard ``s3.session-token-expires-at-ms`` on the resolved
+        credential; falls back to DLF's ``fs.oss.token.expiration`` on any vended bundle.
+        Returns ``None`` when no expiry is advertised (so no refresh is attempted).
+        """
+        raw = resolved.get(S3_SESSION_TOKEN_EXPIRES_AT_MS)
+        if raw is None:
+            raw = next((c.config[OSS_TOKEN_EXPIRATION] for c in storage_credentials if OSS_TOKEN_EXPIRATION in c.config), None)
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _fetch_storage_credentials(self, identifier: tuple[str, ...], refresh_endpoint: str | None) -> list[StorageCredential]:
+        """Re-fetch fresh vended credentials: via the advertised loadCredentials endpoint
+        when present, otherwise by reloading the table (which always returns fresh creds)."""
+        if refresh_endpoint:
+            response = self._session.get(f"{self.uri.rstrip('/')}/{refresh_endpoint.lstrip('/')}")
+            response.raise_for_status()
+            return [StorageCredential.model_validate(c) for c in response.json().get("storage-credentials", [])]
+        response = self._session.get(self.url(Endpoints.load_table, prefixed=True, **self._split_identifier_for_path(identifier)))
+        response.raise_for_status()
+        return TableResponse.model_validate_json(response.text).storage_credentials
+
+    def _build_credentials_provider(
+        self,
+        identifier: tuple[str, ...],
+        table_response: TableResponse,
+        location: str | None,
+        resolved: Properties,
+    ) -> VendedCredentialsProvider | None:
+        """Build a provider that refreshes vended credentials within 5 min of expiry, or
+        ``None`` when the server advertises no expiry to act on."""
+        if not resolved or not location:
+            return None
+        expires_at_ms = self._extract_expires_at_ms(resolved, table_response.storage_credentials)
+        if expires_at_ms is None:
+            return None
+        refresh_endpoint = table_response.config.get(REFRESH_CREDENTIALS_ENDPOINT)
+
+        def refresh() -> tuple[Properties, int | None]:
+            fresh = self._fetch_storage_credentials(identifier, refresh_endpoint)
+            new_resolved = self._resolve_storage_credentials(fresh, location)
+            return new_resolved, self._extract_expires_at_ms(new_resolved, fresh)
+
+        return VendedCredentialsProvider(resolved, expires_at_ms, refresh)
+
     def _response_to_table(self, identifier_tuple: tuple[str, ...], table_response: TableResponse) -> Table:
         # Per Iceberg spec: storage-credentials take precedence over config
         credential_config = self._resolve_storage_credentials(
             table_response.storage_credentials, table_response.metadata_location
         )
+        io = self._load_file_io(
+            {**table_response.metadata.properties, **table_response.config, **credential_config},
+            table_response.metadata_location,
+        )
+        provider = self._build_credentials_provider(
+            identifier_tuple, table_response, table_response.metadata_location, credential_config
+        )
+        if provider is not None:
+            io.set_credentials_provider(provider)
         return Table(
             identifier=identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
-            io=self._load_file_io(
-                {**table_response.metadata.properties, **table_response.config, **credential_config},
-                table_response.metadata_location,
-            ),
+            io=io,
             catalog=self,
             config=table_response.config,
         )
@@ -828,14 +897,20 @@ class RestCatalog(Catalog):
         credential_config = self._resolve_storage_credentials(
             table_response.storage_credentials, table_response.metadata_location
         )
+        io = self._load_file_io(
+            {**table_response.metadata.properties, **table_response.config, **credential_config},
+            table_response.metadata_location,
+        )
+        provider = self._build_credentials_provider(
+            identifier_tuple, table_response, table_response.metadata_location, credential_config
+        )
+        if provider is not None:
+            io.set_credentials_provider(provider)
         return StagedTable(
             identifier=identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
-            io=self._load_file_io(
-                {**table_response.metadata.properties, **table_response.config, **credential_config},
-                table_response.metadata_location,
-            ),
+            io=io,
             catalog=self,
         )
 
