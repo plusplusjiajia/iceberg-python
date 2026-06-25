@@ -40,6 +40,7 @@ from pyiceberg.catalog.rest.scan_planning import (
     PlanSubmitted,
     PlanTableScanRequest,
     ScanTasks,
+    StorageCredential,
 )
 from pyiceberg.exceptions import (
     AuthorizationExpiredError,
@@ -261,6 +262,7 @@ class TableResponse(IcebergBaseModel):
     metadata_location: str | None = Field(alias="metadata-location", default=None)
     metadata: TableMetadata
     config: Properties = Field(default_factory=dict)
+    storage_credentials: list[StorageCredential] = Field(alias="storage-credentials", default_factory=list)
 
 
 class CreateTableRequest(IcebergBaseModel):
@@ -330,6 +332,11 @@ class ListViewsResponse(IcebergBaseModel):
 
 
 _PLANNING_RESPONSE_ADAPTER = TypeAdapter(PlanningResponse)
+
+
+def _is_hadoop_only_config(config: dict[str, str]) -> bool:
+    """Return True if every key is a Hadoop ``fs.*`` key — pyiceberg has no HadoopFileIO to consume them."""
+    return bool(config) and all(k.startswith("fs.") for k in config)
 
 
 class RestCatalog(Catalog):
@@ -770,25 +777,64 @@ class RestCatalog(Catalog):
 
         session.mount(self.uri, SigV4Adapter(**self.properties))
 
+    @staticmethod
+    def _resolve_storage_credentials(storage_credentials: list[StorageCredential], location: str | None) -> Properties:
+        """Pick the longest-prefix storage credential for ``location``.
+
+        Mirrors Java ``S3FileIO.clientForStoragePath``. Hadoop-only (``fs.*``)
+        credentials are filtered out since pyiceberg has no HadoopFileIO to
+        consume them — otherwise a catalog vending both ``fs.*`` and ``s3.*``
+        bundles per location could strand the FileIO with unusable keys.
+
+        See: https://github.com/apache/iceberg/blob/main/aws/src/main/java/org/apache/iceberg/aws/s3/S3FileIO.java
+        """
+        if not storage_credentials or not location:
+            return {}
+
+        consumable = [c for c in storage_credentials if not _is_hadoop_only_config(c.config)]
+
+        best_match: StorageCredential | None = None
+        for cred in consumable:
+            if location.startswith(cred.prefix):
+                if best_match is None or len(cred.prefix) > len(best_match.prefix):
+                    best_match = cred
+
+        # Java S3FileIO ROOT_PREFIX fallback. Only oss:// needs it — s3/s3a/s3n
+        # already match the "s3" credential via startswith in the loop above.
+        if best_match is None and location.startswith("oss://"):
+            best_match = next((c for c in consumable if c.prefix == "s3"), None)
+
+        return best_match.config if best_match else {}
+
     def _response_to_table(self, identifier_tuple: tuple[str, ...], table_response: TableResponse) -> Table:
+        # Per Iceberg spec: storage-credentials take precedence over config
+        credential_config = self._resolve_storage_credentials(
+            table_response.storage_credentials, table_response.metadata_location
+        )
         return Table(
             identifier=identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
             io=self._load_file_io(
-                {**table_response.metadata.properties, **table_response.config}, table_response.metadata_location
+                {**table_response.metadata.properties, **table_response.config, **credential_config},
+                table_response.metadata_location,
             ),
             catalog=self,
             config=table_response.config,
         )
 
     def _response_to_staged_table(self, identifier_tuple: tuple[str, ...], table_response: TableResponse) -> StagedTable:
+        # Per Iceberg spec: storage-credentials take precedence over config
+        credential_config = self._resolve_storage_credentials(
+            table_response.storage_credentials, table_response.metadata_location
+        )
         return StagedTable(
             identifier=identifier_tuple,
             metadata_location=table_response.metadata_location,  # type: ignore
             metadata=table_response.metadata,
             io=self._load_file_io(
-                {**table_response.metadata.properties, **table_response.config}, table_response.metadata_location
+                {**table_response.metadata.properties, **table_response.config, **credential_config},
+                table_response.metadata_location,
             ),
             catalog=self,
         )
