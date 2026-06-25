@@ -1,0 +1,46 @@
+#
+# Fork-only: build wheels + sdist on GitHub Actions and publish to TestPyPI.
+# Reuses the upstream pypi-build-artifacts.yml (Linux x86_64/aarch64 + Windows +
+# macOS intel/arm, CPython 3.10-3.13). Triggered manually; you provide the version.
+#
+# Prerequisite: add a secret under Settings > Secrets and variables > Actions:
+#   TEST_PYPI_API_TOKEN = pypi-...   (your TestPyPI token)
+#
+name: "Fork: Build & Publish to TestPyPI"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.11.1.dev1"
+        type: string
+        required: true
+
+jobs:
+  build:
+    # Upstream reusable build workflow: produces wheels for 5 platforms + one sdist
+    uses: ./.github/workflows/pypi-build-artifacts.yml
+    with:
+      version: ${{ inputs.version }}
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+          path: dist/
+      - name: List artifacts
+        run: ls -R dist/
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          # Token-based publish (simplest). To use Trusted Publishing instead, drop the
+          # line below, add permissions: id-token: write + environment: testpypi to this
+          # job, and register a pending publisher on TestPyPI.
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
