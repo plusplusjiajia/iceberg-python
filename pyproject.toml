@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 [project]
-name = "pyiceberg"
-version = "0.11.1"
-description = "Apache Iceberg is an open table format for huge analytic datasets"
+name = "pyiceberg-dlf"
+version = "0.11.1.dev1"
+description = "Apache Iceberg (DLF-compatible build) - REST catalog SigV4 fixes for Alibaba Cloud DLF"
 authors = [{ name = "Apache Software Foundation", email = "dev@iceberg.apache.org" }]
-requires-python = ">=3.10.0,<4.0.0"
+requires-python = ">=3.10.0,<3.14.0"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
@@ -54,20 +54,20 @@ pyiceberg = "pyiceberg.cli.console:run"
 
 [project.optional-dependencies]
 pyarrow = [
-    "pyarrow>=17.0.0",
+    "pyarrow>=19.0.0,<22.0.0",  # DLF: pyarrow>=22 sends aws-chunked checksums OSS rejects
     "pyiceberg-core>=0.5.1,<0.9.0",
 ]
 pandas = [
     "pandas>=1.0.0",
-    "pyarrow>=17.0.0",
+    "pyarrow>=19.0.0,<22.0.0",  # DLF: pyarrow>=22 sends aws-chunked checksums OSS rejects
 ]
 duckdb = [
     "duckdb>=0.5.0,<2.0.0",
-    "pyarrow>=17.0.0",
+    "pyarrow>=19.0.0,<22.0.0",  # DLF: pyarrow>=22 sends aws-chunked checksums OSS rejects
 ]
 ray = [
     "ray>=2.10.0,<3.0.0",
-    "pyarrow>=17.0.0",
+    "pyarrow>=19.0.0,<22.0.0",  # DLF: pyarrow>=22 sends aws-chunked checksums OSS rejects
     "pandas>=1.0.0",
 ]
 bodo = ["bodo>=2025.7.4"]
