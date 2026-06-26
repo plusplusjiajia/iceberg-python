@@ -17,6 +17,14 @@
 
 # Iceberg Python
 
+> **Note — `pyiceberg-dlf` is an unofficial, community-maintained fork.**
+> This distribution (`pip install pyiceberg-dlf`) repackages Apache PyIceberg
+> with Alibaba Cloud DLF support (REST-catalog SigV4 signing, vended OSS storage
+> credentials, credential auto-refresh). It imports as `pyiceberg`, so it **cannot
+> coexist** with the official `pyiceberg` — use a dedicated virtualenv. It is
+> **not affiliated with, nor endorsed by, the Apache Software Foundation**. For
+> the official package see [`pyiceberg`](https://pypi.org/project/pyiceberg/).
+
 PyIceberg is a Python library for programmatic access to Iceberg table metadata as well as to table data in Iceberg format. It is a Python implementation of the [Iceberg table spec](https://iceberg.apache.org/spec/).
 
 The documentation is available at [https://py.iceberg.apache.org/](https://py.iceberg.apache.org/).

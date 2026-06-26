@@ -1,0 +1,52 @@
+#
+# Fork-only: build wheels + sdist on GitHub Actions and publish to the REAL PyPI.
+# Reuses the upstream pypi-build-artifacts.yml (Linux x86_64/aarch64 + Windows +
+# macOS intel/arm, CPython 3.10-3.13). Triggered manually; you provide the version.
+#
+# This publishes the `pyiceberg-dlf` distribution to https://pypi.org. Validate on
+# TestPyPI first (fork-build-testpypi.yml). PyPI versions are immutable and cannot
+# be reused once uploaded; to fix a bad release, publish a higher version (e.g.
+# 0.11.1.post2) and yank the bad one.
+#
+# Prerequisite: add a secret under Settings > Secrets and variables > Actions:
+#   PYPI_API_TOKEN = pypi-...   (a PyPI token scoped to the pyiceberg-dlf project,
+#                                or an account-wide token for the very first upload)
+#
+name: "Fork: Build & Publish to PyPI"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.11.1.post1"
+        type: string
+        required: true
+
+jobs:
+  build:
+    # Upstream reusable build workflow: produces wheels for 5 platforms + one sdist
+    uses: ./.github/workflows/pypi-build-artifacts.yml
+    with:
+      version: ${{ inputs.version }}
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          merge-multiple: true
+          path: dist/
+      - name: List artifacts
+        run: ls -R dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # No repository-url -> defaults to the real PyPI (https://upload.pypi.org/legacy/)
+          skip-existing: true
+          # Token-based publish (simplest). To use Trusted Publishing instead, drop the
+          # line below, add permissions: id-token: write + environment: pypi to this
+          # job, and register a pending publisher on PyPI.
+          password: ${{ secrets.PYPI_API_TOKEN }}
