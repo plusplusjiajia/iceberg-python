@@ -55,7 +55,7 @@ pyiceberg = "pyiceberg.cli.console:run"
 [project.optional-dependencies]
 pyarrow = [
     "pyarrow>=19.0.0,<22.0.0",  # DLF: pyarrow>=22 sends aws-chunked checksums OSS rejects
-    "pyiceberg-core>=0.5.1,<0.9.0",
+    "pyiceberg-core>=0.9.1,<0.11",  # >=0.9.1: session-arg DataFusion FFI dunder
 ]
 pandas = [
     "pandas>=1.0.0",
@@ -93,8 +93,13 @@ sql-sqlite = ["sqlalchemy>=2.0.18,<3"]
 gcsfs = ["gcsfs>=2023.1.0"]
 rest-sigv4 = ["boto3>=1.24.59"]
 hf = ["huggingface-hub>=0.24.0"]
-pyiceberg-core = ["pyiceberg-core>=0.5.1,<0.9.0"]
-datafusion = ["datafusion>=51,<52"]
+# pyiceberg-core >=0.9.1 exposes the session-arg DataFusion FFI dunder that
+# Table.__datafusion_table_provider__ forwards to. The installed `datafusion`
+# major must match the datafusion-ffi major your pyiceberg-core build links
+# (54 for wheels built from iceberg-rust main; DLF OSS also needs a wheel
+# with iceberg-rust PRs #2651 + #2332 — see the README).
+pyiceberg-core = ["pyiceberg-core>=0.9.1,<0.11"]
+datafusion = ["datafusion>=54,<55"]
 gcp-auth = ["google-auth>=2.4.0"]
 entra-auth = ["azure-identity>=1.25.1"]
 

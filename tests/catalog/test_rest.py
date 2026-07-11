@@ -529,6 +529,113 @@ def test_sigv4_sign_request_with_body(rest_mock: Mocker) -> None:
     assert prepared.headers.get("x-amz-content-sha256") != EMPTY_BODY_SHA256
 
 
+def test_botocore_sigv4_payload_contract() -> None:
+    """Canary for the botocore internals `_IcebergSigV4Auth` depends on.
+
+    The SigV4 adapter sets a base64 ``x-amz-content-sha256`` header (Java
+    flexible-checksum parity) but must sign the canonical request with the HEX
+    payload hash. That only works while botocore's ``SigV4Auth.payload`` keeps
+    computing the hex digest from the body and ignoring the header. If a
+    botocore upgrade changes either, this test goes red before signing silently
+    breaks against the server (boto3 has no upper bound in pyproject).
+    """
+    import hashlib
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    auth = SigV4Auth(Credentials("id", "secret"), "execute-api", "us-west-2")
+    request = AWSRequest(
+        method="POST",
+        url="http://iceberg-test-catalog/v1/namespaces",
+        data=b"{}",
+        headers={"x-amz-content-sha256": "bAsE64-not-hex="},
+    )
+    # payload() must hash the body (hex) and ignore the header value.
+    assert auth.payload(request) == hashlib.sha256(b"{}").hexdigest()
+    # The override reimplements canonical_request from these botocore internals.
+    for name in (
+        "_normalize_url_path",
+        "canonical_query_string",
+        "headers_to_sign",
+        "canonical_headers",
+        "signed_headers",
+        "payload",
+    ):
+        assert callable(getattr(auth, name)), f"botocore SigV4Auth.{name} disappeared"
+
+
+def test_sigv4_signature_uses_hex_payload_hash(rest_mock: Mocker) -> None:
+    """End-to-end canary: recompute the SigV4 signature with the reference
+    algorithm (canonical request carrying the HEX payload hash) and require
+    byte-equality with the signature the adapter produced — the Iceberg Java
+    parity property. If base64 ever leaks into the canonical request (botocore
+    drift), the signatures diverge and this fails.
+    """
+    import hashlib
+    import hmac as hmac_lib
+    from urllib.parse import urlsplit
+
+    catalog = RestCatalog(
+        "rest",
+        **{
+            "uri": TEST_URI,
+            "token": "existing_token",
+            "rest.sigv4-enabled": "true",
+            "rest.signing-region": "us-west-2",
+            "client.access-key-id": "id",
+            "client.secret-access-key": "secret",
+        },
+    )
+
+    body = b'{"namespace": ["canary"]}'
+    prepared = catalog._session.prepare_request(Request("POST", f"{TEST_URI}v1/namespaces", data=body))
+    adapter = catalog._session.adapters[catalog.uri]
+    assert isinstance(adapter, HTTPAdapter)
+    adapter.add_headers(prepared)
+
+    # The header carries the base64 digest (Java flexible-checksum parity)...
+    assert prepared.headers["x-amz-content-sha256"] == base64.b64encode(hashlib.sha256(body).digest()).decode()
+
+    # ...while the signature must come from a canonical request with the HEX digest.
+    authorization = prepared.headers["Authorization"]
+    credential_scope = authorization.split("Credential=")[1].split(",")[0].split("/", 1)[1]
+    signed_headers = authorization.split("SignedHeaders=")[1].split(",")[0].strip()
+    actual_signature = authorization.split("Signature=")[1].strip()
+
+    url_parts = urlsplit(prepared.url)
+    header_lookup = {k.lower(): v for k, v in prepared.headers.items()}
+    canonical_headers = ""
+    for name in signed_headers.split(";"):
+        value = header_lookup.get(name, url_parts.netloc if name == "host" else "")
+        canonical_headers += f"{name}:{' '.join(str(value).split())}\n"
+
+    canonical_request = "\n".join(
+        [
+            "POST",
+            url_parts.path,
+            "",  # no query string
+            canonical_headers,
+            signed_headers,
+            hashlib.sha256(body).hexdigest(),  # HEX, never the base64 header value
+        ]
+    )
+    amz_date = prepared.headers["X-Amz-Date"]
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, credential_scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
+    )
+
+    def hmac_sha256(key: bytes, msg: str) -> bytes:
+        return hmac_lib.new(key, msg.encode(), hashlib.sha256).digest()
+
+    datestamp, region, service, _ = credential_scope.split("/")
+    signing_key = hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256(b"AWS4secret", datestamp), region), service), "aws4_request")
+    expected_signature = hmac_lib.new(signing_key, string_to_sign.encode(), hashlib.sha256).hexdigest()
+
+    assert actual_signature == expected_signature
+
+
 def test_list_tables_404(rest_mock: Mocker) -> None:
     namespace = "examples"
     rest_mock.get(

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import uuid
 import warnings
@@ -152,6 +153,8 @@ if TYPE_CHECKING:
 
 ALWAYS_TRUE = AlwaysTrue()
 DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE = "downcast-ns-timestamp-to-us-on-write"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass()
@@ -1601,13 +1604,18 @@ class Table:
 
         return pl.scan_iceberg(self)
 
-    def __datafusion_table_provider__(self) -> IcebergDataFusionTable:
+    def __datafusion_table_provider__(self, session: Any | None = None) -> IcebergDataFusionTable:
         """Return the DataFusion table provider PyCapsule interface.
 
         To support DataFusion features such as push down filtering, this function will return a PyCapsule
         interface that conforms to the FFI Table Provider required by DataFusion. From an end user perspective
         you should not need to call this function directly. Instead you can use ``register_table`` in
         the DataFusion SessionContext.
+
+        Args:
+            session: The DataFusion session passed by ``register_table`` (datafusion >= 52
+                calls this method with the session so the provider can share its logical
+                extension codec); forwarded to pyiceberg-core.
 
         Returns:
             A PyCapsule DataFusion TableProvider interface.
@@ -1640,11 +1648,23 @@ class Table:
         """
         from pyiceberg_core.datafusion import IcebergDataFusionTable
 
-        return IcebergDataFusionTable(
+        # FileIO properties may hold non-string entries (e.g. the `auth.manager`
+        # object consumed by fsspec); pyiceberg-core requires str -> str and
+        # raises TypeError otherwise, which datafusion then masks as a misleading
+        # "Incompatible libraries" ImportError.
+        file_io_properties = {
+            key: value for key, value in self.io.properties.items() if isinstance(key, str) and isinstance(value, str)
+        }
+        if len(file_io_properties) != len(self.io.properties):
+            dropped = [str(key) for key in self.io.properties if key not in file_io_properties]
+            logger.debug("Dropped non-string FileIO properties for the DataFusion table provider: %s", dropped)
+
+        provider = IcebergDataFusionTable(
             identifier=self.name(),
             metadata_location=self.metadata_location,
-            file_io_properties=self.io.properties,
-        ).__datafusion_table_provider__()
+            file_io_properties=file_io_properties,
+        ).__datafusion_table_provider__
+        return provider(session)
 
 
 class StaticTable(Table):
